@@ -20,15 +20,14 @@ traj_est = file_interface.read_tum_trajectory_file(est_file)
 
 # ==========================
 # SYNCHRONIZE TIMESTAMPS
-# (added tolerance for safety)
 # ==========================
 traj_gt, traj_est = sync.associate_trajectories(
-    traj_gt, traj_est, max_diff=0.02
+    traj_gt, traj_est, max_diff=0.01 
 )
 
 # Safety check
 if len(traj_gt.timestamps) == 0:
-    raise ValueError("❌ No matching timestamps found. Check dataset and trajectory!")
+    raise ValueError(" No matching timestamps found. Check dataset and trajectory!")
 
 # ==========================
 # ALIGN TRAJECTORIES
@@ -82,6 +81,9 @@ plt.title("Trajectory Comparison (Top View X-Z)")
 plt.xlabel("X (m)")
 plt.ylabel("Z (m)")
 plt.grid()
+# FIX 2: Save trajectory plot immediately before next figure()
+plt.savefig("trajectory.png", dpi=150, bbox_inches='tight')
+print("[INFO] Saved trajectory.png")
 
 # ==========================
 # PLOT ATE ERROR
@@ -92,6 +94,8 @@ plt.title("ATE Error Over Time")
 plt.xlabel("Frame")
 plt.ylabel("Error (m)")
 plt.grid()
+plt.savefig("ate.png", dpi=150, bbox_inches='tight')
+print("[INFO] Saved ate.png")
 
 # ==========================
 # PLOT RPE ERROR
@@ -102,6 +106,9 @@ plt.title("RPE Error Over Time")
 plt.xlabel("Frame")
 plt.ylabel("Error (m)")
 plt.grid()
+# FIX 2: Save RPE plot
+plt.savefig("rpe.png", dpi=150, bbox_inches='tight')
+print("[INFO] Saved rpe.png")
 
 # ==========================
 # SAVE RESULTS (IMPORTANT FOR REPORT)
@@ -109,6 +116,13 @@ plt.grid()
 np.savetxt("ate_errors.txt", ate_metric.error)
 np.savetxt("rpe_errors.txt", rpe_metric.error)
 
-plt.savefig("trajectory_plot.png")  # saves last figure
+with open("results.txt", "w") as f:
+    f.write("===== ATE RESULTS =====\n")
+    for k, v in ate_stats.items():
+        f.write(f"{k:>10}: {v:.6f}\n")
+    f.write("\n===== RPE RESULTS =====\n")
+    for k, v in rpe_stats.items():
+        f.write(f"{k:>10}: {v:.6f}\n")
+print("[INFO] Saved results.txt")
 
 plt.show()
