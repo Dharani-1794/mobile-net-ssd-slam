@@ -6,41 +6,41 @@ from ultralytics import YOLO
 # ==========================
 # LOAD MODELS
 # ==========================
+if not os.path.exists("yolov8n.pt"):
+    raise FileNotFoundError("[ERROR] YOLO weights 'yolov8n.pt' not found!")
+if not os.path.exists("MobileNetSSD_deploy.prototxt"):
+    raise FileNotFoundError("[ERROR] MobileNetSSD_deploy.prototxt not found!")
+if not os.path.exists("MobileNetSSD_deploy.caffemodel"):
+    raise FileNotFoundError("[ERROR] MobileNet weights 'MobileNetSSD_deploy.caffemodel' not found!")
+
 yolo = YOLO("yolov8n.pt")
 net = cv2.dnn.readNetFromCaffe(
     "MobileNetSSD_deploy.prototxt",
     "MobileNetSSD_deploy.caffemodel"
 )
-# OPTIONAL: Uncomment below to enable GPU/CUDA acceleration for MobileNet
-# net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-# net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-
 CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
            "bottle", "bus", "car", "cat", "chair", "cow",
            "diningtable", "dog", "horse", "motorbike", "person",
            "pottedplant", "sheep", "sofa", "train", "tvmonitor"]
 
-# YOLO COCO IDs for TRULY DYNAMIC objects only:
-# 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
-# FIX: Removed class 6 (train) — trains follow fixed rails and are
-# rarely the cause of SLAM drift. Keeping only road-level dynamic objects.
-# FIX: Do NOT mask static objects (road, buildings, poles, signs) —
-# those are the most useful features for ORB-SLAM2.
+
 dynamic_classes = {0, 1, 2, 3, 5, 7}  # Set for O(1) lookup
 
-# IMPROVEMENT: Raised confidence threshold to 0.6 → fewer false positives
-# masked. A false positive removes good static features from SLAM.
 CONF_THRESHOLD = 0.6
 
-# IMPROVEMENT: Shrink bounding box before masking.
-# YOLO boxes include background padding around objects.
-# Shrinking to 80% masks only the object core → preserves more edge features.
-# Range: 0.7 (aggressive shrink) to 1.0 (no shrink, original box)
 SHRINK_FACTOR = 0.8
 
 # Dilation kernel — slightly expands the SHRUNK mask to cover object edges
 # that the shrink may have missed. Net effect: core shrunk, edges softly covered.
 DILATE_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+# Boosts speed 3-5x on CPU with minimal accuracy loss for video sequences
+FRAME_SKIP   = 5
+frame_count  = 0
+cached_boxes = []
+# KITTI: baseline=0.54m, fx=718.856 → near objects ~60px, far objects ~10px
+DISPARITY_MIN = 10   # pixels — far objects
+DISPARITY_MAX = 60   # pixels — near objects
 
 # ==========================
 # FOLDERS
@@ -109,7 +109,11 @@ for img_name in sorted(os.listdir(input_left_folder)):
     # ==================================================
     # 1. YOLO → DETECT DYNAMIC OBJECTS → BUILD MASK
     # ==================================================
-    results = yolo(image, conf=CONF_THRESHOLD)[0]
+
+    if frame_count % FRAME_SKIP == 0:
+        results      = yolo(image, conf=CONF_THRESHOLD)[0]
+        cached_boxes = results.boxes
+    frame_count += 1
 
     # Binary mask: 255=static (SLAM uses these), 0=dynamic (SLAM ignores these)
     # This mask is saved separately so the patched ORB-SLAM2 extractor can load it.
@@ -121,10 +125,9 @@ for img_name in sorted(os.listdir(input_left_folder)):
 
     detected_dynamic = False
 
-    for box in results.boxes:
+    for box in cached_boxes:
         cls = int(box.cls[0])
 
-        # FIX: Only process truly dynamic classes — skip static objects entirely
         if cls not in dynamic_classes:
             continue
 
@@ -141,12 +144,15 @@ for img_name in sorted(os.listdir(input_left_folder)):
         # IMPROVEMENT: Shrink box to object core — preserves background features
         x1, y1, x2, y2 = shrink_box(rx1, ry1, rx2, ry2, SHRINK_FACTOR, w, h)
 
-        # Mark dynamic region in feature mask (0 = ORB-SLAM2 will skip this)
-        feature_mask[y1:y2, x1:x2] = 0
+        # Mark same region in left inpaint mask
+        inpaint_mask_left[y1:y2, x1:x2] = 255
 
-        # Mark same region in inpaint masks
-        inpaint_mask_left[y1:y2,  x1:x2] = 255
-        inpaint_mask_right[y1:y2, x1:x2] = 255
+        # Objects appear shifted LEFT in right image by their disparity amount
+        drx1 = max(0, x1 - DISPARITY_MAX)
+        drx2 = max(0, x2 - DISPARITY_MIN)
+        drx1 = min(w, drx1)
+        drx2 = min(w, drx2)
+        inpaint_mask_right[y1:y2, drx1:drx2] = 255
 
         detected_dynamic = True
 
@@ -154,16 +160,16 @@ for img_name in sorted(os.listdir(input_left_folder)):
     if detected_dynamic:
         inpaint_mask_left  = cv2.dilate(inpaint_mask_left,  DILATE_KERNEL, iterations=1)
         inpaint_mask_right = cv2.dilate(inpaint_mask_right, DILATE_KERNEL, iterations=1)
-        # Also dilate the feature mask (so ORB skips edges too)
-        eroded = cv2.erode(feature_mask, DILATE_KERNEL, iterations=1)
-        feature_mask = eroded
 
-    # IMPROVEMENT: Inpaint masked regions so ORB-SLAM2 gets texture instead of
-    # black voids — inpainting fills with surrounding static background texture.
+        # FIX 4: Correct feature_mask update — zero only the dynamic region
+        # Previous erode() wrongly shrank the entire valid static area
+        dynamic_region = cv2.dilate(inpaint_mask_left, DILATE_KERNEL, iterations=1)
+        feature_mask[dynamic_region == 255] = 0
+
     if inpaint_mask_left.any():
-        image = cv2.inpaint(image, inpaint_mask_left, 5, cv2.INPAINT_TELEA)
+        image = cv2.inpaint(image, inpaint_mask_left, 3, cv2.INPAINT_TELEA)
     if inpaint_mask_right.any():
-        right_image = cv2.inpaint(right_image, inpaint_mask_right, 5, cv2.INPAINT_TELEA)
+        right_image = cv2.inpaint(right_image, inpaint_mask_right, 3, cv2.INPAINT_TELEA)
 
     # Save processed images for SLAM (inpainted — no black voids)
     cv2.imwrite(os.path.join(masked_left_folder,  img_name), image)
@@ -173,11 +179,11 @@ for img_name in sorted(os.listdir(input_left_folder)):
     cv2.imwrite(os.path.join(mask_out_folder, img_name), feature_mask)
 
     # ==================================================
-    # 2. MOBILENET SSD → OBJECT DETECTION ON MASKED IMAGE
+    # 2. MOBILENET SSD → OBJECT DETECTION ON ORIGINAL IMAGE
     # ==================================================
-    # Run detection on the masked `image` (not `original`) so detections
-    # reflect the scene after dynamic objects are removed.
-    resized = cv2.resize(image, (300, 300))
+  
+    detect_img = original.copy()
+    resized = cv2.resize(detect_img, (300, 300))
     blob = cv2.dnn.blobFromImage(resized, 0.007843, (300, 300), 127.5)
     net.setInput(blob)
 
@@ -202,7 +208,6 @@ for img_name in sorted(os.listdir(input_left_folder)):
 
             label = CLASSES[idx]
 
-            # FIX: Using `coords` to avoid collision with YOLO loop's `box` variable
             coords = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1 = max(0, int(coords[0]))
             y1 = max(0, int(coords[1]))
@@ -213,14 +218,14 @@ for img_name in sorted(os.listdir(input_left_folder)):
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.rectangle(detect_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # FIX: Clamp text y so label stays within frame at top edge
+         
             text_y = max(15, y1 - 5)
-            cv2.putText(image, label, (x1, text_y),
+            cv2.putText(detect_img, label, (x1, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    cv2.imwrite(os.path.join(detect_folder, img_name), image)
+    cv2.imwrite(os.path.join(detect_folder, img_name), detect_img)
 
 print("[INFO] Pipeline completed successfully.")
 print(f"[INFO] Outputs:")
